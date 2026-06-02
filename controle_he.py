@@ -5,12 +5,24 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import datetime
 import os
 import sys
+try:
+    from PIL import Image, ImageTk
+    _PIL = True
+except ImportError:
+    _PIL = False
 
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+def get_resource(filename: str) -> str:
+    """Localiza arquivo bundled pelo PyInstaller (_MEIPASS) ou na pasta do script."""
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        return os.path.join(meipass, filename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
 EXCEL_FILE = os.path.join(get_base_dir(), "controle_horas_extras.xlsx")
@@ -31,6 +43,25 @@ C_MUTED   = "#7F8C8D"
 C_WHITE   = "#FFFFFF"
 C_ROW_ALT = "#EAF2FB"
 
+_THEMES = {
+    "light": dict(
+        bg="#F4F6F9", header="#1A252F", primary="#2C3E50",
+        green="#1E8449", red="#C0392B", blue="#2E86C1",
+        gray="#BDC3C7", text="#2C3E50", muted="#7F8C8D",
+        white="#FFFFFF", row_alt="#EAF2FB", obs_bg="#FDFEFE",
+        tab_inactive="#D5D8DC", tab_fg="#2C3E50",
+        border="#D5D8DC",
+    ),
+    "dark": dict(
+        bg="#1E1E2E", header="#11111B", primary="#CDD6F4",
+        green="#1E8449", red="#C0392B", blue="#89B4FA",
+        gray="#45475A", text="#CDD6F4", muted="#9399B2",
+        white="#252537", row_alt="#2A2A3E", obs_bg="#252537",
+        tab_inactive="#313244", tab_fg="#CDD6F4",
+        border="#45475A",
+    ),
+}
+
 
 class ControleHE:
     def __init__(self, root: tk.Tk):
@@ -44,7 +75,9 @@ class ControleHE:
         self.timer_running = False
         self.elapsed_seconds = 0
         self._PLACEHOLDER = "Descreva a atividade realizada durante este período..."
+        self._is_dark = False
 
+        self._setup_icon()
         self._apply_styles()
         self._build_ctx_menu()
         self._build_header()
@@ -52,22 +85,62 @@ class ControleHE:
         self._migrate_excel_if_needed()
         self._load_history()
 
-    # ── Estilos ──────────────────────────────────────────────────
+    # ── Ícone da janela ──────────────────────────────────────────
+    def _load_logo_src(self) -> "Image.Image | None":
+        """Carrega a imagem fonte de alta resolução (PNG preferido, ICO como fallback)."""
+        if not _PIL:
+            return None
+        for name in ("Icon_maior.png", "icon.ico"):
+            path = get_resource(name)
+            if os.path.exists(path):
+                try:
+                    img = Image.open(path).convert("RGBA")
+                    # Centraliza em quadrado (recorta sombra/margens)
+                    w, h = img.size
+                    side = min(w, h)
+                    img = img.crop(((w-side)//2, (h-side)//2,
+                                    (w+side)//2, (h+side)//2))
+                    return img
+                except Exception:
+                    continue
+        return None
+
+    def _setup_icon(self):
+        src = self._load_logo_src()
+        if src is not None:
+            try:
+                self._icon_64 = ImageTk.PhotoImage(src.resize((64, 64), Image.LANCZOS))
+                self._icon_32 = ImageTk.PhotoImage(src.resize((32, 32), Image.LANCZOS))
+                self.root.wm_iconphoto(True, self._icon_64, self._icon_32)
+                return
+            except Exception:
+                pass
+        try:
+            self.root.iconbitmap(get_resource("icon.ico"))
+        except Exception:
+            pass
+
+    # ── Estilos ttk ──────────────────────────────────────────────
     def _apply_styles(self):
+        t = _THEMES["dark" if self._is_dark else "light"]
         s = ttk.Style()
         s.theme_use("clam")
-        s.configure("TNotebook", background=C_BG, borderwidth=0)
+        s.configure("TNotebook", background=t["bg"], borderwidth=0)
         s.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"),
-                    padding=[18, 8], background="#D5D8DC", foreground=C_TEXT)
+                    padding=[18, 8], background=t["tab_inactive"],
+                    foreground=t["tab_fg"])
         s.map("TNotebook.Tab",
-              background=[("selected", C_PRIMARY)],
-              foreground=[("selected", C_WHITE)])
-        for name, hc in (("HE.Treeview", C_PRIMARY), ("Sum.Treeview", C_BLUE)):
-            s.configure(name, background=C_WHITE, fieldbackground=C_WHITE,
-                        foreground=C_TEXT, font=("Segoe UI", 9), rowheight=24)
-            s.configure(f"{name}.Heading", background=hc, foreground=C_WHITE,
+              background=[("selected", t["primary"] if not self._is_dark else "#313244")],
+              foreground=[("selected", t["white"] if not self._is_dark else t["primary"])])
+        for name, hc in (("HE.Treeview", t["primary"] if not self._is_dark else "#313244"),
+                         ("Sum.Treeview", t["blue"])):
+            s.configure(name, background=t["white"], fieldbackground=t["white"],
+                        foreground=t["text"], font=("Segoe UI", 9), rowheight=24)
+            s.configure(f"{name}.Heading",
+                        background=t["header"] if self._is_dark else (C_PRIMARY if name == "HE.Treeview" else C_BLUE),
+                        foreground="#CDD6F4" if self._is_dark else "#FFFFFF",
                         font=("Segoe UI", 9, "bold"), relief="flat")
-            s.map(f"{name}.Heading", background=[("active", C_BLUE)])
+            s.map(f"{name}.Heading", background=[("active", t["blue"])])
 
     # ── Menu de contexto ─────────────────────────────────────────
     def _build_ctx_menu(self):
@@ -94,12 +167,111 @@ class ControleHE:
 
     # ── Cabeçalho ────────────────────────────────────────────────
     def _build_header(self):
-        hdr = tk.Frame(self.root, bg=C_HEADER, pady=14)
+        hdr = tk.Frame(self.root, bg=C_HEADER, pady=10)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="CONTROLE DE HORAS EXTRAS",
+
+        # Logo BENA à esquerda — usa PNG de alta resolução
+        src = self._load_logo_src()
+        if src is not None:
+            try:
+                self._hdr_logo = ImageTk.PhotoImage(
+                    src.resize((52, 52), Image.LANCZOS))
+                tk.Label(hdr, image=self._hdr_logo, bg=C_HEADER,
+                         padx=14).pack(side=tk.LEFT)
+            except Exception:
+                pass
+
+        # Botão dark mode à direita
+        self.btn_theme = tk.Button(
+            hdr, text="🌙", font=("Segoe UI", 14),
+            bg=C_HEADER, fg="#AAB7B8",
+            activebackground=C_HEADER, activeforeground="#FFFFFF",
+            relief=tk.FLAT, cursor="hand2", bd=0,
+            command=self._toggle_theme)
+        self.btn_theme.pack(side=tk.RIGHT, padx=(0, 16))
+
+        # Títulos centralizados
+        mid = tk.Frame(hdr, bg=C_HEADER)
+        mid.pack(expand=True)
+        tk.Label(mid, text="CONTROLE DE HORAS EXTRAS",
                  font=("Segoe UI", 15, "bold"), fg=C_WHITE, bg=C_HEADER).pack()
-        tk.Label(hdr, text="Registre, acompanhe e exporte suas horas",
+        tk.Label(mid, text="Registre, acompanhe e exporte suas horas",
                  font=("Segoe UI", 9), fg="#AAB7B8", bg=C_HEADER).pack()
+
+    # ── Dark / Light mode ────────────────────────────────────────
+    def _toggle_theme(self):
+        t_old = _THEMES["dark" if self._is_dark else "light"]
+        self._is_dark = not self._is_dark
+        t_new = _THEMES["dark" if self._is_dark else "light"]
+
+        # Mapa de cores: hex_antigo → hex_novo (lower-case)
+        cmap: dict[str, str] = {}
+        for k in t_new:
+            old_v = t_old[k].lower()
+            new_v = t_new[k]
+            cmap[old_v] = new_v
+
+        # Atualiza globais (usados nas criações dinâmicas de janelas)
+        global C_BG, C_HEADER, C_PRIMARY, C_BLUE, C_GRAY
+        global C_TEXT, C_MUTED, C_WHITE, C_ROW_ALT
+        C_BG      = t_new["bg"]
+        C_HEADER  = t_new["header"]
+        C_PRIMARY = t_new["primary"]
+        C_BLUE    = t_new["blue"]
+        C_GRAY    = t_new["gray"]
+        C_TEXT    = t_new["text"]
+        C_MUTED   = t_new["muted"]
+        C_WHITE   = t_new["white"]
+        C_ROW_ALT = t_new["row_alt"]
+
+        # Recolore todos os widgets
+        self._retheme(self.root, cmap)
+
+        # Estilos ttk
+        self._apply_styles()
+
+        # Cores específicas pós-recolor
+        self.tree.tag_configure("alt", background=t_new["row_alt"])
+        if hasattr(self, "tree_res"):
+            self.tree_res.tag_configure("alt", background=t_new["row_alt"])
+        self.ctx_menu.configure(
+            bg=t_new["white"], fg=t_new["text"],
+            activebackground=t_new["blue"])
+
+        # Atualiza ícone do botão
+        self.btn_theme.config(
+            text="☀" if self._is_dark else "🌙",
+            bg=t_new["header"], activebackground=t_new["header"])
+
+    def _retheme(self, widget, cmap: dict[str, str]):
+        """Percorre a árvore de widgets atualizando cores."""
+        for child in widget.winfo_children():
+            wtype = type(child).__name__
+            for attr in ("background", "bg"):
+                try:
+                    c = str(child.cget(attr)).lower()
+                    if c in cmap:
+                        child.configure(**{attr: cmap[c]})
+                    break
+                except Exception:
+                    pass
+            if wtype not in ("Scrollbar",):
+                for attr in ("foreground", "fg"):
+                    try:
+                        c = str(child.cget(attr)).lower()
+                        if c in cmap:
+                            child.configure(**{attr: cmap[c]})
+                        break
+                    except Exception:
+                        pass
+            for attr in ("highlightbackground", "insertbackground"):
+                try:
+                    c = str(child.cget(attr)).lower()
+                    if c in cmap:
+                        child.configure(**{attr: cmap[c]})
+                except Exception:
+                    pass
+            self._retheme(child, cmap)
 
     # ── Notebook ─────────────────────────────────────────────────
     def _build_notebook(self):
@@ -816,9 +988,5 @@ class ControleHE:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    try:
-        root.iconbitmap(os.path.join(get_base_dir(), "icon.ico"))
-    except Exception:
-        pass
     ControleHE(root)
     root.mainloop()

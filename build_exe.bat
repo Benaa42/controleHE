@@ -25,6 +25,8 @@ echo [3/3] Gerando executavel...
   --windowed ^
   --name "Controle HE" ^
   --icon=icon.ico ^
+  --add-data "icon.ico;." ^
+  --add-data "Icon_maior.png;." ^
   controle_he.py
 
 :: Copia o exe para a pasta raiz
