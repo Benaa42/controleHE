@@ -15,6 +15,10 @@ def get_base_dir():
 
 EXCEL_FILE = os.path.join(get_base_dir(), "controle_horas_extras.xlsx")
 
+# Formato das colunas Excel (7 colunas):
+# [0] Data Início  [1] Hora Início  [2] Data Fim  [3] Hora Fim
+# [4] Duração hh:mm:ss  [5] Duração h decimal  [6] Observações
+
 C_BG      = "#F4F6F9"
 C_HEADER  = "#1A252F"
 C_PRIMARY = "#2C3E50"
@@ -45,6 +49,7 @@ class ControleHE:
         self._build_ctx_menu()
         self._build_header()
         self._build_notebook()
+        self._migrate_excel_if_needed()
         self._load_history()
 
     # ── Estilos ──────────────────────────────────────────────────
@@ -64,7 +69,7 @@ class ControleHE:
                         font=("Segoe UI", 9, "bold"), relief="flat")
             s.map(f"{name}.Heading", background=[("active", C_BLUE)])
 
-    # ── Menu de contexto (botão direito) ─────────────────────────
+    # ── Menu de contexto ─────────────────────────────────────────
     def _build_ctx_menu(self):
         self.ctx_menu = tk.Menu(self.root, tearoff=0,
                                 font=("Segoe UI", 10),
@@ -120,9 +125,6 @@ class ControleHE:
         self._build_buttons(f)
         self._build_obs(f)
         self._build_history(f)
-        tk.Label(f, text=f"Planilha: {EXCEL_FILE}",
-                 font=("Segoe UI", 8), fg=C_MUTED, bg=C_BG,
-                 anchor=tk.W).pack(fill=tk.X, pady=(2, 0))
 
     def _build_timer_card(self, parent):
         card = tk.Frame(parent, bg=C_WHITE,
@@ -197,11 +199,6 @@ class ControleHE:
             self.obs_text.config(fg=C_GRAY)
 
     def _build_history(self, parent):
-        hint = tk.Label(parent,
-                        text="Clique com o botão direito em um registro para Editar ou Excluir",
-                        font=("Segoe UI", 8), fg=C_MUTED, bg=C_BG, anchor=tk.W)
-        hint.pack(fill=tk.X, pady=(0, 3))
-
         outer = tk.LabelFrame(
             parent, text=" Histórico de Registros ",
             font=("Segoe UI", 10, "bold"), fg=C_TEXT,
@@ -210,10 +207,20 @@ class ControleHE:
             padx=10, pady=8)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        cols   = ("Data", "Início", "Fim", "Duração", "Observações")
-        widths = (90, 68, 68, 85, 335)
+        # Rodapé — empacotado ANTES da treeview para sempre aparecer
+        tk.Label(outer, text=f"Planilha: {EXCEL_FILE}",
+                 font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE,
+                 anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Label(outer,
+                 text="* Clique com o botão direito sobre o registro para editar ou excluir",
+                 font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE,
+                 anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
+        # Treeview — 6 colunas incluindo Data Fim
+        cols   = ("D. Início", "Início", "D. Fim", "Fim", "Duração", "Observações")
+        widths = (82, 65, 82, 65, 78, 270)
         self.tree = ttk.Treeview(outer, columns=cols, show="headings",
-                                 height=7, style="HE.Treeview")
+                                 height=6, style="HE.Treeview")
         for col, w in zip(cols, widths):
             self.tree.heading(col, text=col)
             anc = tk.W if col == "Observações" else tk.CENTER
@@ -261,8 +268,7 @@ class ControleHE:
         tk.Label(c1, text="TOTAL DO PERÍODO", font=("Segoe UI", 8, "bold"),
                  fg=C_MUTED, bg=C_WHITE).pack(anchor=tk.W)
         self.lbl_periodo_sub = tk.Label(c1, text="",
-                                        font=("Segoe UI", 8), fg=C_MUTED,
-                                        bg=C_WHITE)
+                                        font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE)
         self.lbl_periodo_sub.pack(anchor=tk.W)
         self.lbl_periodo = tk.Label(c1, text="--:--",
                                     font=("Consolas", 30, "bold"),
@@ -295,8 +301,8 @@ class ControleHE:
             highlightbackground="#D5D8DC", highlightthickness=1,
             padx=10, pady=8)
         det.pack(fill=tk.BOTH, expand=True)
-        cols   = ("Data", "Início", "Fim", "Duração", "Observações")
-        widths = (90, 68, 68, 90, 330)
+        cols   = ("D. Início", "Início", "D. Fim", "Fim", "Duração", "Observações")
+        widths = (82, 65, 82, 65, 78, 265)
         self.tree_res = ttk.Treeview(det, columns=cols, show="headings",
                                      height=8, style="Sum.Treeview")
         for col, w in zip(cols, widths):
@@ -355,7 +361,8 @@ class ControleHE:
                     d = self._parse_date(row[0])
                     if d is None:
                         continue
-                    sec = self._parse_dur(row[3])
+                    _, dur_sec_f = self._compute_dur(row[0], row[1], row[2], row[3])
+                    sec = int(dur_sec_f * 3600)
                     if ws0 <= d <= we0:
                         sem_sec += sec
                     if ps <= d <= pe:
@@ -374,9 +381,10 @@ class ControleHE:
             self.tree_res.delete(item)
         for i, row in enumerate(sorted(period_rows, key=lambda r: str(r[0]))):
             tag = "alt" if i % 2 == 0 else ""
+            # row: [0]d_ini [1]h_ini [2]d_fim [3]h_fim [4]dur [5]dur_dec [6]obs
             self.tree_res.insert("", tk.END,
                                  values=(row[0], row[1], row[2],
-                                         row[3], row[5] or ""),
+                                         row[3], row[4], row[6] or ""),
                                  tags=(tag,))
 
     def _on_tab_change(self, _):
@@ -398,11 +406,33 @@ class ControleHE:
 
     @staticmethod
     def _parse_dur(val) -> int:
+        if isinstance(val, (int, float)):          # valor cacheado pelo Excel (fração de dia)
+            return int(float(val) * 86400)
         try:
             h, m, s = str(val).split(":")
             return int(h) * 3600 + int(m) * 60 + int(s)
         except Exception:
             return 0
+
+    @staticmethod
+    def _compute_dur(d_ini, h_ini, d_fim, h_fim) -> tuple[str, float]:
+        """Calcula duração a partir das colunas de data/hora. Retorna (hh:mm:ss, decimal)."""
+        try:
+            dt_i = datetime.datetime.strptime(f"{d_ini} {h_ini}", "%d/%m/%Y %H:%M:%S")
+            dt_f = datetime.datetime.strptime(f"{d_fim} {h_fim}", "%d/%m/%Y %H:%M:%S")
+            total = int((dt_f - dt_i).total_seconds())
+            h, r  = divmod(total, 3600)
+            m, s  = divmod(r, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}", round(total / 3600, 4)
+        except Exception:
+            return "00:00:00", 0.0
+
+    @staticmethod
+    def _dur_formulas(r: int) -> tuple[str, str]:
+        """Retorna as fórmulas Excel de duração para a linha r."""
+        inner = (f"(DATE(RIGHT(C{r},4),MID(C{r},4,2),LEFT(C{r},2))+TIMEVALUE(D{r}))"
+                 f"-(DATE(RIGHT(A{r},4),MID(A{r},4,2),LEFT(A{r},2))+TIMEVALUE(B{r}))")
+        return f"={inner}", f"=({inner})*24"
 
     # ══════════════════════════════════════════════════════════════
     # TIMER
@@ -412,7 +442,7 @@ class ControleHE:
         self.elapsed_seconds = 0
         self.timer_running = True
         self.status_dot.config(fg=C_GREEN)
-        self.status_lbl.config(text="Em andamento...", fg=C_GREEN)
+        self.status_lbl.config(text="Em andando...", fg=C_GREEN)
         self.inicio_lbl.config(text=f"Início:  {self.inicio.strftime('%H:%M:%S')}")
         self.data_lbl.config(text=f"Data:    {self.inicio.strftime('%d/%m/%Y')}")
         self.btn_iniciar.config(state=tk.DISABLED, bg=C_GRAY)
@@ -443,9 +473,12 @@ class ControleHE:
         dur_str = f"{h:02d}:{m:02d}:{s:02d}"
         dur_dec = round(total / 3600, 4)
         self._save_excel(self.inicio, fim, dur_str, dur_dec, obs)
-        self._tree_insert(self.inicio.strftime("%d/%m/%Y"),
-                          self.inicio.strftime("%H:%M:%S"),
-                          fim.strftime("%H:%M:%S"), dur_str, obs)
+        self._tree_insert(
+            self.inicio.strftime("%d/%m/%Y"),
+            self.inicio.strftime("%H:%M:%S"),
+            fim.strftime("%d/%m/%Y"),
+            fim.strftime("%H:%M:%S"),
+            dur_str, obs)
         messagebox.showinfo("Registro Salvo",
                             f"Horas extras registradas!\n\n"
                             f"Duração: {dur_str}  ({dur_dec} h)\n\n"
@@ -475,19 +508,19 @@ class ControleHE:
             return
         item = sel[0]
         vals = self.tree.item(item, "values")
-        # vals = (data, inicio_h, fim_h, duracao, obs)
+        # vals = (d_ini, h_ini, d_fim, h_fim, dur, obs)
 
         dlg = tk.Toplevel(self.root)
         dlg.title("Editar Registro")
-        dlg.geometry("480x330")
+        dlg.geometry("500x370")
         dlg.resizable(False, False)
         dlg.configure(bg=C_BG)
         dlg.grab_set()
         dlg.transient(self.root)
         dlg.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width()  - 480) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 330) // 2
-        dlg.geometry(f"480x330+{x}+{y}")
+        x = self.root.winfo_x() + (self.root.winfo_width()  - 500) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 370) // 2
+        dlg.geometry(f"500x370+{x}+{y}")
 
         tk.Frame(dlg, bg=C_PRIMARY, height=4).pack(fill=tk.X)
         tk.Label(dlg, text="Editar Registro",
@@ -503,7 +536,7 @@ class ControleHE:
                      fg=C_TEXT, bg=C_BG, anchor=tk.W
                      ).grid(row=r, column=0, sticky=tk.W, pady=5, padx=(0, 10))
 
-        def ent(r, val, w=20):
+        def ent(r, val, w=18):
             e = tk.Entry(form, font=("Segoe UI", 10), relief=tk.FLAT,
                          highlightbackground="#D5D8DC", highlightthickness=1,
                          bg=C_WHITE, width=w)
@@ -516,41 +549,53 @@ class ControleHE:
                      fg=C_MUTED, bg=C_BG).grid(row=r, column=2,
                                                 padx=(8, 0), sticky=tk.W)
 
-        lbl("Data início:",   0); e_data  = ent(0, vals[0]); hint("dd/mm/aaaa", 0)
-        lbl("Hora início:",   1); e_ini   = ent(1, vals[1]); hint("hh:mm:ss",   1)
-        lbl("Hora fim:",      2); e_fim   = ent(2, vals[2]); hint("hh:mm:ss",   2)
-        lbl("Observações:",   3)
+        lbl("Data início:",  0); e_d_ini = ent(0, vals[0]); hint("dd/mm/aaaa", 0)
+        lbl("Hora início:",  1); e_h_ini = ent(1, vals[1]); hint("hh:mm:ss",   1)
+        lbl("Data fim:",     2); e_d_fim = ent(2, vals[2]); hint("dd/mm/aaaa", 2)
+        lbl("Hora fim:",     3); e_h_fim = ent(3, vals[3]); hint("hh:mm:ss",   3)
+        lbl("Observações:",  4)
         e_obs = tk.Text(form, height=3, font=("Segoe UI", 10), relief=tk.FLAT,
                         highlightbackground="#D5D8DC", highlightthickness=1,
-                        bg=C_WHITE, width=32)
-        e_obs.insert("1.0", vals[4])
-        e_obs.grid(row=3, column=1, columnspan=2, sticky=tk.EW, pady=5)
+                        bg=C_WHITE, width=30)
+        e_obs.insert("1.0", vals[5])
+        e_obs.grid(row=4, column=1, columnspan=2, sticky=tk.EW, pady=5)
 
         def salvar():
-            d_v  = e_data.get().strip()
-            in_v = e_ini.get().strip()
-            fi_v = e_fim.get().strip()
-            ob_v = e_obs.get("1.0", tk.END).strip()
+            d_ini_v = e_d_ini.get().strip()
+            h_ini_v = e_h_ini.get().strip()
+            d_fim_v = e_d_fim.get().strip()
+            h_fim_v = e_h_fim.get().strip()
+            ob_v    = e_obs.get("1.0", tk.END).strip()
             try:
-                dt_i = datetime.datetime.strptime(f"{d_v} {in_v}",
-                                                  "%d/%m/%Y %H:%M:%S")
-                dt_f = datetime.datetime.strptime(f"{d_v} {fi_v}",
-                                                  "%d/%m/%Y %H:%M:%S")
+                dt_i = datetime.datetime.strptime(
+                    f"{d_ini_v} {h_ini_v}", "%d/%m/%Y %H:%M:%S")
+                dt_f = datetime.datetime.strptime(
+                    f"{d_fim_v} {h_fim_v}", "%d/%m/%Y %H:%M:%S")
                 if dt_f <= dt_i:
-                    dt_f += datetime.timedelta(days=1)
+                    messagebox.showerror(
+                        "Data inválida",
+                        "A data/hora de fim deve ser posterior ao início.",
+                        parent=dlg)
+                    return
                 total = int((dt_f - dt_i).total_seconds())
-                h, r = divmod(total, 3600)
-                m2, s = divmod(r, 60)
-                dur_str = f"{h:02d}:{m2:02d}:{s:02d}"
+                hh, rr = divmod(total, 3600)
+                mm, ss = divmod(rr, 60)
+                dur_str = f"{hh:02d}:{mm:02d}:{ss:02d}"
                 dur_dec = round(total / 3600, 4)
             except ValueError:
-                messagebox.showerror("Formato inválido",
-                                     "Data: dd/mm/aaaa\nHora: hh:mm:ss",
-                                     parent=dlg)
+                messagebox.showerror(
+                    "Formato inválido",
+                    "Data: dd/mm/aaaa\nHora: hh:mm:ss",
+                    parent=dlg)
                 return
-            self._excel_update_row(vals[0], vals[1], vals[2],
-                                   d_v, in_v, fi_v, dur_str, dur_dec, ob_v)
-            self.tree.item(item, values=(d_v, in_v, fi_v, dur_str, ob_v))
+            # Valores antigos para localizar no Excel
+            old_d_ini, old_h_ini, old_h_fim = vals[0], vals[1], vals[3]
+            self._excel_update_row(old_d_ini, old_h_ini, old_h_fim,
+                                   d_ini_v, h_ini_v, d_fim_v, h_fim_v,
+                                   dur_str, dur_dec, ob_v)
+            self.tree.item(item, values=(d_ini_v, h_ini_v,
+                                         d_fim_v, h_fim_v,
+                                         dur_str, ob_v))
             dlg.destroy()
 
         bf = tk.Frame(dlg, bg=C_BG, pady=14)
@@ -564,23 +609,26 @@ class ControleHE:
                   padx=20, pady=7, cursor="hand2",
                   command=dlg.destroy).pack(side=tk.LEFT, padx=8)
 
-    def _excel_update_row(self, old_d, old_i, old_f,
-                          new_d, new_i, new_f, dur_str, dur_dec, obs):
+    def _excel_update_row(self, old_d_ini, old_h_ini, old_h_fim,
+                          new_d_ini, new_h_ini, new_d_fim, new_h_fim,
+                          dur_str, dur_dec, obs):
         if not os.path.exists(EXCEL_FILE):
             return
         try:
             wb = openpyxl.load_workbook(EXCEL_FILE)
             ws = wb.active
             for row in ws.iter_rows(min_row=2):
-                if (str(row[0].value) == str(old_d) and
-                        str(row[1].value) == str(old_i) and
-                        str(row[2].value) == str(old_f)):
-                    row[0].value = new_d
-                    row[1].value = new_i
-                    row[2].value = new_f
-                    row[3].value = dur_str
-                    row[4].value = dur_dec
-                    row[5].value = obs
+                # col[0]=d_ini, col[1]=h_ini, col[3]=h_fim
+                if (str(row[0].value) == str(old_d_ini) and
+                        str(row[1].value) == str(old_h_ini) and
+                        str(row[3].value) == str(old_h_fim)):
+                    row[0].value = new_d_ini
+                    row[1].value = new_h_ini
+                    row[2].value = new_d_fim
+                    row[3].value = new_h_fim
+                    row[4].value = dur_str
+                    row[5].value = dur_dec
+                    row[6].value = obs
                     break
             wb.save(EXCEL_FILE)
         except Exception as e:
@@ -596,30 +644,30 @@ class ControleHE:
                                    "Clique com o botão direito em um registro.")
             return
         vals = self.tree.item(sel[0], "values")
+        # vals = (d_ini, h_ini, d_fim, h_fim, dur, obs)
         ok = messagebox.askyesno(
             "Confirmar Exclusão",
             f"Excluir este registro?\n\n"
-            f"  Data:    {vals[0]}\n"
-            f"  Início:  {vals[1]}\n"
-            f"  Fim:     {vals[2]}\n"
-            f"  Duração: {vals[3]}\n\n"
+            f"  Início:  {vals[0]} {vals[1]}\n"
+            f"  Fim:     {vals[2]} {vals[3]}\n"
+            f"  Duração: {vals[4]}\n\n"
             "Esta ação não pode ser desfeita.")
         if not ok:
             return
         self.tree.delete(sel[0])
-        self._excel_delete_row(vals[0], vals[1], vals[2])
+        self._excel_delete_row(vals[0], vals[1], vals[3])
         self._recolor(self.tree)
 
-    def _excel_delete_row(self, data, inicio, fim):
+    def _excel_delete_row(self, d_ini, h_ini, h_fim):
         if not os.path.exists(EXCEL_FILE):
             return
         try:
             wb = openpyxl.load_workbook(EXCEL_FILE)
             ws = wb.active
             for row in ws.iter_rows(min_row=2):
-                if (str(row[0].value) == str(data) and
-                        str(row[1].value) == str(inicio) and
-                        str(row[2].value) == str(fim)):
+                if (str(row[0].value) == str(d_ini) and
+                        str(row[1].value) == str(h_ini) and
+                        str(row[3].value) == str(h_fim)):
                     ws.delete_rows(row[0].row)
                     break
             wb.save(EXCEL_FILE)
@@ -633,33 +681,10 @@ class ControleHE:
     # ══════════════════════════════════════════════════════════════
     # EXCEL
     # ══════════════════════════════════════════════════════════════
-    def _save_excel(self, inicio, fim, dur_str, dur_dec, obs):
-        if os.path.exists(EXCEL_FILE):
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            ws = wb.active
-        else:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Horas Extras"
-            self._excel_headers(ws)
-        row_idx = ws.max_row + 1
-        vals = [inicio.strftime("%d/%m/%Y"), inicio.strftime("%H:%M:%S"),
-                fim.strftime("%H:%M:%S"), dur_str, dur_dec, obs]
-        for ci, v in enumerate(vals, 1):
-            cell = ws.cell(row=row_idx, column=ci, value=v)
-            cell.alignment = Alignment(
-                horizontal="center" if ci < 6 else "left",
-                vertical="center", wrap_text=(ci == 6))
-            if row_idx % 2 == 0:
-                cell.fill = PatternFill("solid", fgColor="EBF5FB")
-            cell.border = Border(bottom=Side(style="thin", color="D5D8DC"))
-        ws.row_dimensions[row_idx].height = 18
-        wb.save(EXCEL_FILE)
-
     def _excel_headers(self, ws):
-        hdrs = ["Data", "Hora Início", "Hora Fim",
-                "Duração (hh:mm:ss)", "Duração (h decimal)", "Observações"]
-        widths = [14, 14, 14, 22, 22, 55]
+        hdrs   = ["Data Início", "Hora Início", "Data Fim", "Hora Fim",
+                  "Duração (hh:mm:ss)", "Duração (h decimal)", "Observações"]
+        widths = [14, 14, 14, 14, 22, 22, 55]
         for ci, (h, w) in enumerate(zip(hdrs, widths), 1):
             cell = ws.cell(row=1, column=ci, value=h)
             cell.fill = PatternFill("solid", fgColor="1A252F")
@@ -669,9 +694,102 @@ class ControleHE:
         ws.row_dimensions[1].height = 24
         ws.freeze_panes = "A2"
 
-    def _tree_insert(self, data, inicio, fim, dur, obs):
+    def _excel_style_row(self, ws, row_idx: int, n_cols: int):
+        for ci in range(1, n_cols + 1):
+            cell = ws.cell(row=row_idx, column=ci)
+            last_col = n_cols
+            cell.alignment = Alignment(
+                horizontal="center" if ci < last_col else "left",
+                vertical="center",
+                wrap_text=(ci == last_col))
+            if row_idx % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor="EBF5FB")
+            cell.border = Border(bottom=Side(style="thin", color="D5D8DC"))
+        ws.row_dimensions[row_idx].height = 18
+
+    def _save_excel(self, inicio: datetime.datetime,
+                    fim: datetime.datetime,
+                    dur_str: str, dur_dec: float, obs: str):
+        if os.path.exists(EXCEL_FILE):
+            wb = openpyxl.load_workbook(EXCEL_FILE)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Horas Extras"
+            self._excel_headers(ws)
+
+        row_idx = ws.max_row + 1
+        # Colunas A-D e G: valores diretos
+        for ci, v in enumerate([
+            inicio.strftime("%d/%m/%Y"),
+            inicio.strftime("%H:%M:%S"),
+            fim.strftime("%d/%m/%Y"),
+            fim.strftime("%H:%M:%S"),
+        ], 1):
+            ws.cell(row=row_idx, column=ci, value=v)
+        ws.cell(row=row_idx, column=7, value=obs)
+
+        # Colunas E e F: fórmulas automáticas
+        fe, ff = self._dur_formulas(row_idx)
+        ce = ws.cell(row=row_idx, column=5, value=fe)
+        ce.number_format = '[h]:mm:ss'
+        cf = ws.cell(row=row_idx, column=6, value=ff)
+        cf.number_format = '0.0000'
+
+        self._excel_style_row(ws, row_idx, 7)
+        wb.save(EXCEL_FILE)
+
+    # ── Migração: formato antigo (6 cols) → novo (7 cols) ────────
+    def _migrate_excel_if_needed(self):
+        if not os.path.exists(EXCEL_FILE):
+            return
+        try:
+            wb = openpyxl.load_workbook(EXCEL_FILE)
+            ws = wb.active
+            header_a1 = str(ws.cell(1, 1).value or "")
+            # Novo formato já tem "Data Início" na célula A1
+            if header_a1 == "Data Início":
+                wb.close()
+                return
+            # Lê todas as linhas de dados
+            rows = []
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row[0]:
+                    rows.append(row)
+            # Reconstrói a planilha com novo formato
+            ws.delete_rows(1, ws.max_row + 1)
+            self._excel_headers(ws)
+            for old_row in rows:
+                # old: [0]d_ini [1]h_ini [2]h_fim [3]dur_str [4]dur_dec [5]obs
+                d_ini, h_ini, h_fim = str(old_row[0]), str(old_row[1]), str(old_row[2])
+                dur_str = str(old_row[3])
+                dur_dec = old_row[4]
+                obs     = old_row[5] or ""
+                # Calcula data fim a partir do início + duração
+                try:
+                    dt_i  = datetime.datetime.strptime(f"{d_ini} {h_ini}",
+                                                       "%d/%m/%Y %H:%M:%S")
+                    h, m, s = dur_str.split(":")
+                    delta = datetime.timedelta(seconds=int(h)*3600 +
+                                               int(m)*60 + int(s))
+                    d_fim = (dt_i + delta).strftime("%d/%m/%Y")
+                except Exception:
+                    d_fim = d_ini
+                row_idx = ws.max_row + 1
+                new_vals = [d_ini, h_ini, d_fim, h_fim, dur_str, dur_dec, obs]
+                for ci, v in enumerate(new_vals, 1):
+                    ws.cell(row=row_idx, column=ci, value=v)
+                self._excel_style_row(ws, row_idx, 7)
+            wb.save(EXCEL_FILE)
+        except Exception:
+            pass
+
+    # ── Treeview helpers ─────────────────────────────────────────
+    def _tree_insert(self, d_ini, h_ini, d_fim, h_fim, dur, obs):
         tag = "alt" if len(self.tree.get_children()) % 2 == 0 else ""
-        self.tree.insert("", 0, values=(data, inicio, fim, dur, obs),
+        self.tree.insert("", 0,
+                         values=(d_ini, h_ini, d_fim, h_fim, dur, obs),
                          tags=(tag,))
 
     def _load_history(self):
@@ -685,9 +803,11 @@ class ControleHE:
                     if r[0]]
             for i, row in enumerate(reversed(rows)):
                 tag = "alt" if i % 2 == 0 else ""
+                # Duração sempre calculada das colunas de data/hora (ignora E/F)
+                dur_str, _ = self._compute_dur(row[0], row[1], row[2], row[3])
                 self.tree.insert("", tk.END,
                                  values=(row[0], row[1], row[2],
-                                         row[3], row[5] or ""),
+                                         row[3], dur_str, row[6] or ""),
                                  tags=(tag,))
             wb.close()
         except Exception:
