@@ -27,6 +27,7 @@ echo [3/3] Gerando executavel...
   --icon=icon.ico ^
   --add-data "icon.ico;." ^
   --add-data "Icon_maior.png;." ^
+  --add-data "secrets.env;." ^
   controle_he.py
 
 :: Copia o exe para a pasta raiz

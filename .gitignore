@@ -18,3 +18,7 @@ __pycache__/
 # Windows
 Thumbs.db
 desktop.ini
+
+# Credenciais locais — NUNCA commitar
+secrets.env
+config.json

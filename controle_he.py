@@ -3,6 +3,13 @@ from tkinter import ttk, messagebox
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import datetime
+import hashlib
+import hmac as _hmac
+import base64
+import json
+import re
+import smtplib
+from email.mime.text import MIMEText
 import os
 import sys
 try:
@@ -25,7 +32,66 @@ def get_resource(filename: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
-EXCEL_FILE = os.path.join(get_base_dir(), "controle_horas_extras.xlsx")
+EXCEL_FILE  = os.path.join(get_base_dir(), "controle_horas_extras.xlsx")
+CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
+
+# Chaves internas (embutidas no exe)
+_CIPHER_KEY = b"BenaHE_Cipher_Key_2026!!@@##$$%%"
+_HMAC_KEY   = b"BenaHE_HMAC_Integrity_2026!!!!@@"
+
+# Mapeamento SMTP automatico por dominio
+SMTP_MAP = {
+    "gmail.com":      ("smtp.gmail.com",        587),
+    "yahoo.com":      ("smtp.mail.yahoo.com",   587),
+    "yahoo.com.br":   ("smtp.mail.yahoo.com",   587),
+    "hotmail.com":    ("smtp-mail.outlook.com", 587),
+    "outlook.com":    ("smtp-mail.outlook.com", 587),
+    "live.com":       ("smtp-mail.outlook.com", 587),
+}
+
+def _enc(text: str) -> str:
+    b = text.encode("utf-8")
+    return base64.urlsafe_b64encode(
+        bytes(c ^ _CIPHER_KEY[i % 32] for i, c in enumerate(b))
+    ).decode()
+
+def _dec(token: str) -> str:
+    b = base64.urlsafe_b64decode(token.encode())
+    return bytes(c ^ _CIPHER_KEY[i % 32] for i, c in enumerate(b)).decode("utf-8")
+
+def _cfg_sign(cfg: dict) -> str:
+    clean = {k: v for k, v in sorted(cfg.items()) if k != "sig"}
+    return _hmac.new(_HMAC_KEY,
+                     json.dumps(clean, ensure_ascii=False).encode("utf-8"),
+                     hashlib.sha256).hexdigest()
+
+def _mask_email(email: str) -> str:
+    try:
+        local, domain = email.split("@", 1)
+        return f"{local[:3]}***@{domain}"
+    except Exception:
+        return "***"
+
+def _load_smtp_secrets():
+    """Carrega credenciais SMTP de secrets.env (nunca commitado no git)."""
+    for path in (get_resource("secrets.env"),
+                 os.path.join(get_base_dir(), "secrets.env")):
+        try:
+            data = {}
+            for line in open(path, encoding="utf-8"):
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    data[k.strip()] = v.strip()
+            if data.get("SMTP_USER"):
+                return (data["SMTP_USER"], data.get("SMTP_PWD", ""),
+                        data.get("SMTP_HOST", "smtp.gmail.com"),
+                        int(data.get("SMTP_PORT", 587)))
+        except Exception:
+            pass
+    return "", "", "smtp.gmail.com", 587
+
+_SMTP_USER, _SMTP_PWD, _SMTP_HOST, _SMTP_PORT = _load_smtp_secrets()
 
 # Formato das colunas Excel (7 colunas):
 # [0] Data Início  [1] Hora Início  [2] Data Fim  [3] Hora Fim
@@ -75,7 +141,11 @@ class ControleHE:
         self.timer_running = False
         self.elapsed_seconds = 0
         self._PLACEHOLDER = "Descreva a atividade realizada durante este período..."
-        self._is_dark = False
+
+        # Carrega preferências antes de construir a UI
+        _cfg = self._load_config()
+        self._is_dark = _cfg.get("dark_mode", False)
+        self._sync_globals()
 
         self._setup_icon()
         self._apply_styles()
@@ -83,7 +153,24 @@ class ControleHE:
         self._build_header()
         self._build_notebook()
         self._migrate_excel_if_needed()
-        self._load_history()
+
+        if not self._has_password():
+            self._load_history()
+
+        # Aplica retheme se dark mode carregado do config
+        if self._is_dark:
+            t_l = _THEMES["light"]
+            t_d = _THEMES["dark"]
+            cmap = {t_l[k].lower(): t_d[k] for k in t_d}
+            self._retheme(self.root, cmap)
+            if hasattr(self, "tree"):
+                self.tree.tag_configure("alt", background=t_d["row_alt"])
+            if hasattr(self, "btn_theme"):
+                self.btn_theme.config(text="☀",
+                                      bg=t_d["header"],
+                                      activebackground=t_d["header"])
+
+        self.root.after(100, self._check_password_on_start)
 
     # ── Ícone da janela ──────────────────────────────────────────
     def _load_logo_src(self) -> "Image.Image | None":
@@ -238,10 +325,21 @@ class ControleHE:
             bg=t_new["white"], fg=t_new["text"],
             activebackground=t_new["blue"])
 
-        # Atualiza ícone do botão
+        # Atualiza ícone do botão e persiste preferência
         self.btn_theme.config(
             text="☀" if self._is_dark else "🌙",
             bg=t_new["header"], activebackground=t_new["header"])
+        cfg = self._load_config()
+        cfg["dark_mode"] = self._is_dark
+        self._save_config(cfg)
+
+    def _sync_globals(self):
+        global C_BG, C_HEADER, C_PRIMARY, C_BLUE, C_GRAY
+        global C_TEXT, C_MUTED, C_WHITE, C_ROW_ALT
+        t = _THEMES["dark" if self._is_dark else "light"]
+        C_BG = t["bg"]; C_HEADER = t["header"]; C_PRIMARY = t["primary"]
+        C_BLUE = t["blue"]; C_GRAY = t["gray"]; C_TEXT = t["text"]
+        C_MUTED = t["muted"]; C_WHITE = t["white"]; C_ROW_ALT = t["row_alt"]
 
     def _retheme(self, widget, cmap: dict[str, str]):
         """Percorre a árvore de widgets atualizando cores."""
@@ -279,13 +377,23 @@ class ControleHE:
         wrap.pack(fill=tk.BOTH, expand=True)
         self.nb = ttk.Notebook(wrap)
         self.nb.pack(fill=tk.BOTH, expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
         tab1 = tk.Frame(self.nb, bg=C_BG)
         tab2 = tk.Frame(self.nb, bg=C_BG)
         self.nb.add(tab1, text="  Registrar  ")
         self.nb.add(tab2, text="  Resumo  ")
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
         self._build_tab_registro(tab1)
         self._build_tab_resumo(tab2)
+
+        # Botão cadeado — sobreposto via place() no canto superior direito
+        self.btn_senha = tk.Button(
+            wrap, text="🔒", font=("Segoe UI", 15),
+            bg=C_BG, fg="#F5C518",
+            activebackground=C_BG, activeforeground="#FFD700",
+            relief=tk.FLAT, cursor="hand2", bd=0, padx=4, pady=0,
+            command=self._open_password_dialog)
+        self.btn_senha.place(relx=1.0, rely=0, anchor=tk.NE, x=-2, y=-6)
+        self._update_lock_icon()
 
     # ══════════════════════════════════════════════════════════════
     # ABA 1 — REGISTRAR
@@ -849,6 +957,364 @@ class ControleHE:
     def _recolor(self, tree):
         for i, item in enumerate(tree.get_children()):
             tree.item(item, tags=("alt" if i % 2 == 0 else "",))
+
+    # ══════════════════════════════════════════════════════════════
+    # SISTEMA DE SENHA
+    # ══════════════════════════════════════════════════════════════
+    def _load_config(self) -> dict:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("sig") and cfg["sig"] != _cfg_sign(cfg):
+                return {"_tampered": True}
+            return cfg
+        except Exception:
+            return {}
+
+    def _save_config(self, cfg: dict):
+        cfg.pop("_tampered", None)
+        cfg["sig"] = _cfg_sign(cfg)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _hash(pwd: str) -> str:
+        return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _valid_email(email: str) -> bool:
+        return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip()))
+
+    def _has_password(self) -> bool:
+        cfg = self._load_config()
+        return cfg.get("_tampered") or bool(cfg.get("password_hash"))
+
+    def _update_lock_icon(self):
+        if hasattr(self, "btn_senha"):
+            locked = self._has_password()
+            self.btn_senha.config(text="🔒" if locked else "🔓", fg="#F5C518")
+
+    def _check_password_on_start(self):
+        cfg = self._load_config()
+        if not cfg.get("password_hash"):
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Acesso Restrito")
+        dlg.geometry("380x260")
+        dlg.resizable(False, False)
+        dlg.configure(bg=C_BG)
+        dlg.grab_set()
+        dlg.transient(self.root)
+        dlg.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        self._center(dlg, 380, 260)
+
+        tk.Frame(dlg, bg=C_RED, height=4).pack(fill=tk.X)
+        tk.Label(dlg, text="🔒", font=("Segoe UI", 28), bg=C_BG, fg=C_PRIMARY).pack(pady=(16, 2))
+        tk.Label(dlg, text="Acesso protegido por senha",
+                 font=("Segoe UI", 11, "bold"), fg=C_TEXT, bg=C_BG).pack()
+        tk.Label(dlg, text="Digite sua senha para continuar:",
+                 font=("Segoe UI", 9), fg=C_MUTED, bg=C_BG).pack(pady=(2, 10))
+        e_pwd = tk.Entry(dlg, show="●", font=("Segoe UI", 11), relief=tk.FLAT,
+                         width=24, highlightbackground="#D5D8DC",
+                         highlightthickness=1, bg=C_WHITE)
+        e_pwd.pack(pady=(0, 4))
+        e_pwd.focus_set()
+        msg_lbl = tk.Label(dlg, text="", font=("Segoe UI", 8), fg=C_RED, bg=C_BG)
+        msg_lbl.pack()
+        attempts = [0]
+
+        def tentar():
+            if self._hash(e_pwd.get()) == cfg["password_hash"]:
+                dlg.destroy()
+                self._load_history()
+            else:
+                attempts[0] += 1
+                e_pwd.delete(0, tk.END)
+                msg_lbl.config(text=f"Senha incorreta. Tentativa {attempts[0]}.")
+
+        def esqueci():
+            if cfg.get("_tampered"):
+                messagebox.showerror("Config Adulterado",
+                    "Arquivo modificado externamente. Recuperacao desabilitada.", parent=dlg)
+                return
+            try:
+                email_real = _dec(cfg["email_enc"]) if "email_enc" in cfg else cfg.get("email", "")
+            except Exception:
+                email_real = ""
+            if not email_real:
+                messagebox.showwarning("Email nao cadastrado",
+                    "Nenhum email de recuperacao encontrado.", parent=dlg)
+                return
+            if "pwd_enc" not in cfg:
+                messagebox.showinfo("Acao Necessaria",
+                    "Remova e redefina sua senha no botao do cadeado para\n"
+                    "habilitar recuperacao por email.", parent=dlg)
+                return
+            self._dialog_recuperar_senha(dlg, cfg, email_real)
+
+        e_pwd.bind("<Return>", lambda _: tentar())
+        bf = tk.Frame(dlg, bg=C_BG)
+        bf.pack(pady=(8, 0))
+        tk.Button(bf, text="  Entrar  ", font=("Segoe UI", 10, "bold"),
+                  bg=C_GREEN, fg=C_WHITE, relief=tk.FLAT,
+                  padx=18, pady=7, cursor="hand2",
+                  command=tentar).pack(side=tk.LEFT, padx=6)
+        tk.Button(bf, text="Esqueci a senha", font=("Segoe UI", 9),
+                  bg=C_BG, fg=C_BLUE, relief=tk.FLAT, cursor="hand2",
+                  command=esqueci).pack(side=tk.LEFT)
+
+    def _open_password_dialog(self):
+        if self._has_password():
+            self._dialog_gerenciar_senha()
+        else:
+            self._dialog_definir_senha()
+
+    def _dialog_definir_senha(self, parent_dlg=None):
+        owner = parent_dlg or self.root
+        dlg = tk.Toplevel(owner)
+        dlg.title("Definir Senha de Acesso")
+        dlg.geometry("420x300")
+        dlg.resizable(False, False)
+        dlg.configure(bg=C_BG)
+        dlg.grab_set()
+        dlg.transient(owner)
+        self._center(dlg, 420, 300)
+
+        tk.Frame(dlg, bg=C_BLUE, height=4).pack(fill=tk.X)
+        tk.Label(dlg, text="Definir Senha de Acesso",
+                 font=("Segoe UI", 13, "bold"), fg=C_TEXT, bg=C_BG).pack(pady=(14, 4))
+        tk.Label(dlg, text="Preencha os campos abaixo.",
+                 font=("Segoe UI", 9), fg=C_MUTED, bg=C_BG).pack(pady=(0, 10))
+        form = tk.Frame(dlg, bg=C_BG, padx=30)
+        form.pack(fill=tk.X)
+        form.columnconfigure(1, weight=1)
+
+        def lbl(text, r):
+            tk.Label(form, text=text, font=("Segoe UI", 9, "bold"),
+                     fg=C_TEXT, bg=C_BG, anchor=tk.W, width=20
+                     ).grid(row=r, column=0, sticky=tk.W, pady=5, padx=(0, 8))
+
+        def ent(r, show=""):
+            e = tk.Entry(form, show=show, font=("Segoe UI", 10), relief=tk.FLAT,
+                         highlightbackground="#D5D8DC", highlightthickness=1,
+                         bg=C_WHITE, width=24)
+            e.grid(row=r, column=1, sticky=tk.EW, pady=5)
+            return e
+
+        lbl("E-mail de recuperacao:", 0); e_email = ent(0)
+        lbl("Nova senha:", 1);            e_pwd   = ent(1, show="*")
+        lbl("Confirmar senha:", 2);       e_pwd2  = ent(2, show="*")
+        msg = tk.Label(dlg, text="", font=("Segoe UI", 8), fg=C_RED, bg=C_BG)
+        msg.pack(pady=(6, 0))
+
+        def salvar():
+            email = e_email.get().strip()
+            pwd   = e_pwd.get()
+            pwd2  = e_pwd2.get()
+            if not self._valid_email(email):
+                msg.config(text="Informe um e-mail valido."); return
+            if len(pwd) < 4:
+                msg.config(text="Senha deve ter no minimo 4 caracteres."); return
+            if pwd != pwd2:
+                msg.config(text="As senhas nao coincidem."); return
+            cfg = self._load_config()
+            cfg["password_hash"] = self._hash(pwd)
+            cfg["pwd_enc"]       = _enc(pwd)
+            cfg["email_enc"]     = _enc(email)
+            cfg.pop("email", None)
+            self._save_config(cfg)
+            self._apply_excel_protection(pwd)
+            self._update_lock_icon()
+            messagebox.showinfo("Senha Definida",
+                "Senha configurada com sucesso!", parent=dlg)
+            dlg.destroy()
+            if parent_dlg:
+                parent_dlg.destroy()
+
+        bf = tk.Frame(dlg, bg=C_BG, pady=10)
+        bf.pack()
+        tk.Button(bf, text="  Salvar  ", font=("Segoe UI", 10, "bold"),
+                  bg=C_GREEN, fg=C_WHITE, relief=tk.FLAT,
+                  padx=20, pady=7, cursor="hand2",
+                  command=salvar).pack(side=tk.LEFT, padx=6)
+        tk.Button(bf, text="Cancelar", font=("Segoe UI", 10),
+                  bg=C_GRAY, fg=C_WHITE, relief=tk.FLAT,
+                  padx=20, pady=7, cursor="hand2",
+                  command=dlg.destroy).pack(side=tk.LEFT)
+
+    def _dialog_gerenciar_senha(self):
+        cfg = self._load_config()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Gerenciar Senha")
+        dlg.geometry("400x300")
+        dlg.resizable(False, False)
+        dlg.configure(bg=C_BG)
+        dlg.grab_set()
+        dlg.transient(self.root)
+        self._center(dlg, 400, 300)
+
+        tk.Frame(dlg, bg=C_BLUE, height=4).pack(fill=tk.X)
+        tk.Label(dlg, text="Gerenciar Senha",
+                 font=("Segoe UI", 13, "bold"), fg=C_TEXT, bg=C_BG).pack(pady=(14, 2))
+        try:
+            email_show = _dec(cfg.get("email_enc", "")) if cfg.get("email_enc") else cfg.get("email", "—")
+        except Exception:
+            email_show = "—"
+        tk.Label(dlg, text=f"E-mail de recuperacao: {_mask_email(email_show)}",
+                 font=("Segoe UI", 9), fg=C_MUTED, bg=C_BG).pack()
+        tk.Frame(dlg, bg="#D5D8DC", height=1).pack(fill=tk.X, padx=24, pady=12)
+
+        alt = tk.LabelFrame(dlg, text=" Alterar Senha ",
+                            font=("Segoe UI", 9, "bold"), bg=C_BG, fg=C_TEXT,
+                            highlightbackground="#D5D8DC", highlightthickness=1,
+                            relief=tk.FLAT, padx=14, pady=8)
+        alt.pack(fill=tk.X, padx=22, pady=(0, 8))
+        f1 = tk.Frame(alt, bg=C_BG); f1.pack(fill=tk.X)
+        tk.Label(f1, text="Senha atual:", font=("Segoe UI", 9),
+                 fg=C_TEXT, bg=C_BG, width=14, anchor=tk.W).pack(side=tk.LEFT)
+        e_atual = tk.Entry(f1, show="●", font=("Segoe UI", 10), relief=tk.FLAT,
+                           width=18, highlightbackground="#D5D8DC",
+                           highlightthickness=1, bg=C_WHITE)
+        e_atual.pack(side=tk.LEFT)
+        f2 = tk.Frame(alt, bg=C_BG); f2.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(f2, text="Nova senha:", font=("Segoe UI", 9),
+                 fg=C_TEXT, bg=C_BG, width=14, anchor=tk.W).pack(side=tk.LEFT)
+        e_nova = tk.Entry(f2, show="●", font=("Segoe UI", 10), relief=tk.FLAT,
+                          width=18, highlightbackground="#D5D8DC",
+                          highlightthickness=1, bg=C_WHITE)
+        e_nova.pack(side=tk.LEFT)
+        msg_alt = tk.Label(alt, text="", font=("Segoe UI", 8), fg=C_RED, bg=C_BG)
+        msg_alt.pack()
+
+        def alterar():
+            if self._hash(e_atual.get()) != cfg["password_hash"]:
+                msg_alt.config(text="Senha atual incorreta."); return
+            nova = e_nova.get()
+            if len(nova) < 4:
+                msg_alt.config(text="Nova senha: minimo 4 caracteres."); return
+            cfg["password_hash"] = self._hash(nova)
+            cfg["pwd_enc"] = _enc(nova)
+            self._save_config(cfg)
+            self._apply_excel_protection(nova)
+            messagebox.showinfo("Alterado", "Senha alterada com sucesso!", parent=dlg)
+            dlg.destroy()
+
+        def remover():
+            nova_v = e_nova.get().strip()
+            if nova_v:
+                msg_alt.config(text="Para remover, deixe Nova senha em branco."); return
+            if not e_atual.get():
+                msg_alt.config(text="Preencha a senha atual para remover."); return
+            if self._hash(e_atual.get()) != cfg["password_hash"]:
+                msg_alt.config(text="Senha atual incorreta."); return
+            if not messagebox.askyesno("Remover Senha",
+                "Deseja remover a senha?\nA protecao da planilha tambem sera removida.",
+                parent=dlg):
+                return
+            cfg.pop("password_hash", None); cfg.pop("pwd_enc", None)
+            cfg.pop("email_enc", None); cfg.pop("email", None)
+            self._save_config(cfg)
+            self._apply_excel_protection(None)
+            self._update_lock_icon()
+            messagebox.showinfo("Removido", "Senha removida!", parent=dlg)
+            dlg.destroy()
+
+        tk.Button(alt, text="Alterar", font=("Segoe UI", 9, "bold"),
+                  bg=C_BLUE, fg=C_WHITE, relief=tk.FLAT,
+                  padx=12, pady=4, cursor="hand2",
+                  command=alterar).pack(anchor=tk.E, pady=(4, 0))
+        tk.Button(dlg, text="Remover Senha",
+                  font=("Segoe UI", 9), bg="#FADBD8", fg=C_RED,
+                  relief=tk.FLAT, padx=14, pady=5, cursor="hand2",
+                  command=remover).pack(pady=(0, 8))
+
+    def _dialog_recuperar_senha(self, parent_dlg, cfg: dict, email_real: str):
+        masked = _mask_email(email_real)
+        dlg = tk.Toplevel(parent_dlg)
+        dlg.title("Recuperacao de Senha")
+        dlg.geometry("400x210")
+        dlg.resizable(False, False)
+        dlg.configure(bg=C_BG)
+        dlg.grab_set()
+        dlg.transient(parent_dlg)
+        self._center(dlg, 400, 210)
+
+        tk.Frame(dlg, bg="#E67E22", height=4).pack(fill=tk.X)
+        tk.Label(dlg, text="Recuperacao de Senha",
+                 font=("Segoe UI", 13, "bold"), fg=C_TEXT, bg=C_BG).pack(pady=(14, 6))
+        tk.Label(dlg, text="A senha sera enviada para: " + masked,
+                 font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG).pack()
+        tk.Label(dlg, text="Remetente: " + _mask_email(_SMTP_USER) if _SMTP_USER else "Remetente nao configurado.",
+                 font=("Segoe UI", 9), fg=C_MUTED, bg=C_BG).pack(pady=(2, 0))
+        msg_lbl = tk.Label(dlg, text="", font=("Segoe UI", 8), fg=C_RED, bg=C_BG)
+        msg_lbl.pack(pady=(6, 0))
+
+        def enviar():
+            if not _SMTP_USER:
+                msg_lbl.config(text="Remetente SMTP nao configurado (secrets.env).")
+                return
+            try:
+                senha_real = _dec(cfg["pwd_enc"])
+            except Exception:
+                msg_lbl.config(text="Erro: senha nao pode ser recuperada."); return
+            msg_lbl.config(text="Enviando...", fg=C_BLUE)
+            dlg.update()
+            corpo = ("Ola,\n\nSegue sua senha de acesso ao Controle de Horas Extras (Bena):\n\n"
+                     "    Senha: " + senha_real +
+                     "\n\nRecomendamos alterar sua senha apos o acesso.\n\n"
+                     "-- Sistema Controle HE by Bena")
+            mime = MIMEText(corpo, "plain", "utf-8")
+            mime["Subject"] = "Recuperacao de Senha - Controle HE by Bena"
+            mime["From"]    = _SMTP_USER
+            mime["To"]      = email_real
+            try:
+                with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=15) as srv:
+                    srv.ehlo(); srv.starttls()
+                    srv.login(_SMTP_USER, _SMTP_PWD)
+                    srv.send_message(mime)
+                messagebox.showinfo("Email Enviado",
+                    "Senha enviada para: " + masked + "\nVerifique sua caixa de entrada.",
+                    parent=dlg)
+                dlg.destroy()
+            except smtplib.SMTPAuthenticationError:
+                msg_lbl.config(text="Falha na autenticacao SMTP.", fg=C_RED)
+            except Exception as exc:
+                msg_lbl.config(text="Erro: " + str(exc), fg=C_RED)
+
+        bf = tk.Frame(dlg, bg=C_BG, pady=12)
+        bf.pack()
+        tk.Button(bf, text="  Enviar Email  ", font=("Segoe UI", 10, "bold"),
+                  bg="#E67E22", fg=C_WHITE, relief=tk.FLAT,
+                  padx=18, pady=8, cursor="hand2",
+                  command=enviar).pack(side=tk.LEFT, padx=6)
+        tk.Button(bf, text="Cancelar", font=("Segoe UI", 10),
+                  bg=C_GRAY, fg=C_WHITE, relief=tk.FLAT,
+                  padx=18, pady=8, cursor="hand2",
+                  command=dlg.destroy).pack(side=tk.LEFT)
+
+    def _apply_excel_protection(self, password):
+        if not os.path.exists(EXCEL_FILE):
+            return
+        try:
+            wb = openpyxl.load_workbook(EXCEL_FILE)
+            ws = wb.active
+            if password:
+                ws.protection.sheet    = True
+                ws.protection.password = password
+                ws.protection.enable()
+            else:
+                ws.protection.sheet    = False
+                ws.protection.password = ""
+                ws.protection.disable()
+            wb.save(EXCEL_FILE)
+        except Exception:
+            pass
+
+    def _center(self, dlg, w, h):
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
 
     # ══════════════════════════════════════════════════════════════
     # EXCEL
