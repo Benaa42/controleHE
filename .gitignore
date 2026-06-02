@@ -1,0 +1,20 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Planilha gerada em runtime
+controle_horas_extras.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+desktop.ini
