@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import datetime
@@ -19,6 +19,9 @@ except ImportError:
     _PIL = False
 
 
+__version__ = "1.0.0"
+
+
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -34,6 +37,24 @@ def get_resource(filename: str) -> str:
 
 EXCEL_FILE  = os.path.join(get_base_dir(), "controle_horas_extras.xlsx")
 CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
+EXCEL_NAME  = "controle_horas_extras.xlsx"
+
+def _find_onedrive() -> str:
+    """Retorna o caminho raiz do OneDrive, ou pasta home como fallback."""
+    # 1) variáveis de ambiente do Windows
+    for var in ("OneDriveConsumer", "OneDriveCommercial", "OneDrive"):
+        od = os.environ.get(var, "")
+        if od and os.path.isdir(od):
+            return od
+    # 2) subpastas da home que contenham 'onedrive' no nome
+    home = os.path.expanduser("~")
+    try:
+        for name in os.listdir(home):
+            if "onedrive" in name.lower() and os.path.isdir(os.path.join(home, name)):
+                return os.path.join(home, name)
+    except Exception:
+        pass
+    return home
 
 # Chaves internas (embutidas no exe)
 _CIPHER_KEY = b"BenaHE_Cipher_Key_2026!!@@##$$%%"
@@ -132,7 +153,7 @@ _THEMES = {
 class ControleHE:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Controle de HE by Bena")
+        self.root.title(f"Controle de HE by Bena  v{__version__}")
         self.root.geometry("780x700")
         self.root.resizable(False, False)
         self.root.configure(bg=C_BG)
@@ -147,15 +168,20 @@ class ControleHE:
         self._is_dark = _cfg.get("dark_mode", False)
         self._sync_globals()
 
+        # Aplica caminho da planilha salvo anteriormente
+        global EXCEL_FILE
+        _saved_path = _cfg.get("excel_path", "")
+        if _saved_path and os.path.exists(_saved_path):
+            EXCEL_FILE = _saved_path
+
         self._setup_icon()
         self._apply_styles()
         self._build_ctx_menu()
         self._build_header()
         self._build_notebook()
-        self._migrate_excel_if_needed()
 
-        if not self._has_password():
-            self._load_history()
+        # Verifica planilha APÓS UI estar visível
+        self.root.after(200, self._check_excel_setup)
 
         # Aplica retheme se dark mode carregado do config
         if self._is_dark:
@@ -170,7 +196,7 @@ class ControleHE:
                                       bg=t_d["header"],
                                       activebackground=t_d["header"])
 
-        self.root.after(100, self._check_password_on_start)
+        # Senha verificada dentro de _check_excel_setup (evita dupla chamada)
 
     # ── Ícone da janela ──────────────────────────────────────────
     def _load_logo_src(self) -> "Image.Image | None":
@@ -281,7 +307,7 @@ class ControleHE:
         mid = tk.Frame(hdr, bg=C_HEADER)
         mid.pack(expand=True)
         tk.Label(mid, text="CONTROLE DE HORAS EXTRAS",
-                 font=("Segoe UI", 15, "bold"), fg=C_WHITE, bg=C_HEADER).pack()
+                 font=("Segoe UI", 15, "bold"), fg=C_BLUE, bg=C_HEADER).pack()
         tk.Label(mid, text="Registre, acompanhe e exporte suas horas",
                  font=("Segoe UI", 9), fg="#AAB7B8", bg=C_HEADER).pack()
 
@@ -488,9 +514,10 @@ class ControleHE:
         outer.pack(fill=tk.BOTH, expand=True)
 
         # Rodapé — empacotado ANTES da treeview para sempre aparecer
-        tk.Label(outer, text=f"Planilha: {EXCEL_FILE}",
-                 font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE,
-                 anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
+        self.lbl_path = tk.Label(outer, text=f"Planilha: {EXCEL_FILE}",
+                                  font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE,
+                                  anchor=tk.W)
+        self.lbl_path.pack(side=tk.BOTTOM, fill=tk.X)
         tk.Label(outer,
                  text="* Clique com o botão direito sobre o registro para editar ou excluir",
                  font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE,
@@ -994,6 +1021,136 @@ class ControleHE:
             locked = self._has_password()
             self.btn_senha.config(text="🔒" if locked else "🔓", fg="#F5C518")
 
+    # ══════════════════════════════════════════════════════════════
+    # CONFIGURAÇÃO DA PLANILHA
+    # ══════════════════════════════════════════════════════════════
+    def _check_excel_setup(self):
+        """Chamado após a UI estar visível. Verifica se a planilha está configurada."""
+        global EXCEL_FILE
+        cfg = self._load_config()
+        path = cfg.get("excel_path", "")
+        if path and os.path.exists(path):
+            EXCEL_FILE = path
+        elif not path:
+            # Primeira execução
+            self._dialog_excel_setup(primeira_vez=True)
+        else:
+            # Caminho configurado mas arquivo não existe
+            resp = messagebox.askyesno(
+                "Planilha não encontrada",
+                f"A planilha configurada não foi encontrada:\n{path}\n\n"
+                "Deseja reconfigurar o local da planilha?")
+            if resp:
+                self._dialog_excel_setup(primeira_vez=False)
+            else:
+                # Usa padrão
+                EXCEL_FILE = os.path.join(get_base_dir(), EXCEL_NAME)
+
+        # Após definir o caminho, continua a inicialização
+        self._migrate_excel_if_needed()
+        self._update_path_label()
+        if not self._has_password():
+            self._load_history()
+        self.root.after(100, self._check_password_on_start)
+
+    def _dialog_excel_setup(self, primeira_vez: bool = True):
+        """Dialog para o usuário escolher onde fica a planilha."""
+        global EXCEL_FILE
+        titulo = "Bem-vindo ao Controle de HE" if primeira_vez else "Reconfigurar Planilha"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(titulo)
+        dlg.geometry("480x360")
+        dlg.resizable(False, False)
+        dlg.configure(bg=C_BG)
+        dlg.grab_set()
+        dlg.transient(self.root)
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        self._center(dlg, 480, 360)
+
+        tk.Frame(dlg, bg=C_BLUE, height=4).pack(fill=tk.X)
+        tk.Label(dlg, text=titulo,
+                 font=("Segoe UI", 13, "bold"), fg=C_TEXT, bg=C_BG).pack(pady=(16, 4))
+        msg = ("Onde deseja armazenar a planilha de controle de horas?"
+               if primeira_vez else
+               "Escolha o novo local para a planilha:")
+        tk.Label(dlg, text=msg,
+                 font=("Segoe UI", 9), fg=C_MUTED, bg=C_BG).pack(pady=(0, 14))
+
+        chosen = [None]
+
+        def make_option(icon, title, desc, cmd):
+            """Cria uma opção como botão real clicável."""
+            outer = tk.Frame(dlg, bg=C_WHITE,
+                             highlightbackground="#D5D8DC", highlightthickness=1)
+            outer.pack(fill=tk.X, padx=28, pady=5)
+
+            inner = tk.Frame(outer, bg=C_WHITE)
+            inner.pack(fill=tk.X, padx=12, pady=8)
+
+            # Label do título + descrição (coluna esquerda)
+            left = tk.Frame(inner, bg=C_WHITE)
+            left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(left, text=f"{icon}  {title}",
+                     font=("Segoe UI", 10, "bold"),
+                     fg=C_PRIMARY, bg=C_WHITE, anchor=tk.W).pack(anchor=tk.W)
+            tk.Label(left, text=desc,
+                     font=("Segoe UI", 8), fg=C_MUTED, bg=C_WHITE, anchor=tk.W).pack(anchor=tk.W)
+
+            # Botão real na coluna direita
+            tk.Button(inner, text="Selecionar",
+                      font=("Segoe UI", 9, "bold"),
+                      bg=C_BLUE, fg=C_WHITE, relief=tk.FLAT,
+                      padx=12, pady=5, cursor="hand2",
+                      activebackground=C_PRIMARY,
+                      command=cmd).pack(side=tk.RIGHT, padx=(8, 0))
+
+        def escolha_mesmo_local():
+            chosen[0] = os.path.join(get_base_dir(), EXCEL_NAME)
+            dlg.destroy()
+
+        def escolha_onedrive():
+            od_root = _find_onedrive()
+            folder = filedialog.askdirectory(
+                title="Escolha a pasta no OneDrive",
+                initialdir=od_root, parent=dlg)
+            if folder:
+                chosen[0] = os.path.join(folder, EXCEL_NAME)
+                dlg.destroy()
+
+        def escolha_existente():
+            path = filedialog.askopenfilename(
+                title="Selecione a planilha existente",
+                filetypes=[("Excel", "*.xlsx *.xlsm"), ("Todos", "*.*")],
+                parent=dlg)
+            if path:
+                chosen[0] = path
+                dlg.destroy()
+
+        make_option("📁", "Mesmo local do aplicativo",
+                    "Salva na mesma pasta do .exe",
+                    escolha_mesmo_local)
+        make_option("☁", "OneDrive",
+                    "Escolha uma pasta dentro do OneDrive",
+                    escolha_onedrive)
+        make_option("📂", "Indicar arquivo existente",
+                    "Selecione um arquivo .xlsx já existente",
+                    escolha_existente)
+
+        dlg.wait_window()
+
+        # Aplica a escolha (fallback: mesmo local)
+        path = chosen[0] or os.path.join(get_base_dir(), EXCEL_NAME)
+        EXCEL_FILE = path
+        cfg = self._load_config()
+        cfg["excel_path"] = path
+        self._save_config(cfg)
+
+    def _update_path_label(self):
+        """Atualiza o label de caminho da planilha no rodapé do histórico."""
+        if hasattr(self, "lbl_path"):
+            self.lbl_path.config(text=f"Planilha: {EXCEL_FILE}")
+
     def _check_password_on_start(self):
         cfg = self._load_config()
         if not cfg.get("password_hash"):
@@ -1016,7 +1173,8 @@ class ControleHE:
                  font=("Segoe UI", 9), fg=C_MUTED, bg=C_BG).pack(pady=(2, 10))
         e_pwd = tk.Entry(dlg, show="●", font=("Segoe UI", 11), relief=tk.FLAT,
                          width=24, highlightbackground="#D5D8DC",
-                         highlightthickness=1, bg=C_WHITE)
+                         highlightthickness=1, bg=C_WHITE,
+                         fg=C_TEXT, insertbackground=C_TEXT)
         e_pwd.pack(pady=(0, 4))
         e_pwd.focus_set()
         msg_lbl = tk.Label(dlg, text="", font=("Segoe UI", 8), fg=C_RED, bg=C_BG)
@@ -1097,7 +1255,8 @@ class ControleHE:
         def ent(r, show=""):
             e = tk.Entry(form, show=show, font=("Segoe UI", 10), relief=tk.FLAT,
                          highlightbackground="#D5D8DC", highlightthickness=1,
-                         bg=C_WHITE, width=24)
+                         bg=C_WHITE, width=24,
+                         fg=C_TEXT, insertbackground=C_TEXT)
             e.grid(row=r, column=1, sticky=tk.EW, pady=5)
             return e
 
@@ -1174,14 +1333,16 @@ class ControleHE:
                  fg=C_TEXT, bg=C_BG, width=14, anchor=tk.W).pack(side=tk.LEFT)
         e_atual = tk.Entry(f1, show="●", font=("Segoe UI", 10), relief=tk.FLAT,
                            width=18, highlightbackground="#D5D8DC",
-                           highlightthickness=1, bg=C_WHITE)
+                           highlightthickness=1, bg=C_WHITE,
+                           fg=C_TEXT, insertbackground=C_TEXT)
         e_atual.pack(side=tk.LEFT)
         f2 = tk.Frame(alt, bg=C_BG); f2.pack(fill=tk.X, pady=(4, 0))
         tk.Label(f2, text="Nova senha:", font=("Segoe UI", 9),
                  fg=C_TEXT, bg=C_BG, width=14, anchor=tk.W).pack(side=tk.LEFT)
         e_nova = tk.Entry(f2, show="●", font=("Segoe UI", 10), relief=tk.FLAT,
                           width=18, highlightbackground="#D5D8DC",
-                          highlightthickness=1, bg=C_WHITE)
+                          highlightthickness=1, bg=C_WHITE,
+                          fg=C_TEXT, insertbackground=C_TEXT)
         e_nova.pack(side=tk.LEFT)
         msg_alt = tk.Label(alt, text="", font=("Segoe UI", 8), fg=C_RED, bg=C_BG)
         msg_alt.pack()
